@@ -1,0 +1,46 @@
+{
+  "name": "repo",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "export": "next export",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@emailjs/browser": "^4.4.1",
+    "@gsap/react": "^2.1.2",
+    "@react-three/drei": "^10.7.4",
+    "@react-three/fiber": "^9.3.0",
+    "axios": "^1.12.0",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.23.24",
+    "gsap": "^3.13.0",
+    "js-cookie": "^3.0.5",
+    "locomotive-scroll": "^4.1.4",
+    "next": "15.5.7",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-fast-marquee": "^1.6.5",
+    "react-google-recaptcha": "^3.1.0",
+    "swiper": "^11.2.10",
+    "three": "^0.179.1"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@tailwindcss/postcss": "^4",
+    "@types/js-cookie": "^3.0.6",
+    "@types/locomotive-scroll": "^4.1.4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/react-google-recaptcha": "^2.1.9",
+    "@types/three": "^0.182.0",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.2",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}

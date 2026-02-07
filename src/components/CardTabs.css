@@ -1,0 +1,21 @@
+.card-active {
+    background-color: #08080826;
+    border: 1px solid #03ffb247;
+}
+
+
+.card-inactive {
+    background-color: #08080826;
+    border: 1px solid #d4d4d447;
+}
+
+
+.slideup-fadein {
+    opacity: 0;
+    transform: translateY(40px);
+    /* start 40px lower */
+    will-change: transform, opacity;
+}
+
+
+

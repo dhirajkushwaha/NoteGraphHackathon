@@ -1,0 +1,17 @@
+.gradient-text-comp {
+  background: linear-gradient(to right, #10954C, #3AFF16);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  position: relative;
+}
+
+.gradient-text-comp::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  width: 100%;
+  background: linear-gradient(to right, #10954C, #3AFF16);
+}
