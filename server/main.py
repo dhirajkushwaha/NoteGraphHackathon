@@ -563,76 +563,194 @@ async def upload_file(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Upload file to study space."""
+    """Upload file to study space with detailed progress tracking."""
+    
+    logger.info(f"File upload started for space: {space_id}")
+    logger.info(f"Uploaded by user: {current_user['_id']} ({current_user['username']})")
+    logger.info(f"Filename: {file.filename}")
+    logger.info(f"Content type: {file.content_type}")
 
     # Check space exists and user has access
     space = db.studyspaces.find_one({"_id": space_id})
     if not space:
+        logger.warning(f"Space not found for upload: {space_id}")
         raise HTTPException(status_code=404, detail="Study space not found")
 
     if current_user["_id"] not in space.get("users", []):
-        raise HTTPException(status_code=403, detail="Not authorized")
+        logger.warning(f"Unauthorized upload attempt: User {current_user['_id']} to space {space_id}")
+        logger.warning(f"Space users: {space.get('users', [])}")
+        raise HTTPException(status_code=403, detail="Not authorized to upload to this space")
 
     # Validate file
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Invalid file")
+        logger.warning(f"Invalid file uploaded - no filename provided")
+        raise HTTPException(status_code=400, detail="Invalid file - no filename provided")
 
-    # Validate file size (max 10MB)
-    MAX_SIZE = 10 * 1024 * 1024  # 10MB
-    content = await file.read()
-
-    if len(content) > MAX_SIZE:
-        raise HTTPException(status_code=400, detail="File too large (max 10MB)")
-
-    if len(content) == 0:
-        raise HTTPException(status_code=400, detail="File is empty")
-
-    # Save file
-    file_ext = os.path.splitext(file.filename)[1]
-    filename = f"{uuid.uuid4()}{file_ext}"
-    filepath = os.path.join(UPLOAD_DIR, filename)
+    # Validate file extension
+    allowed_extensions = ['.pdf', '.doc', '.docx', '.txt', '.md', '.csv', '.json']
+    file_ext = os.path.splitext(file.filename)[1].lower()
+    if file_ext not in allowed_extensions:
+        logger.warning(f"Invalid file extension: {file_ext} for file: {file.filename}")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"File type not allowed. Allowed types: {', '.join([ext for ext in allowed_extensions if ext])}"
+        )
 
     try:
-        with open(filepath, "wb") as f:
-            f.write(content)
-    except Exception as e:
-        logger.error(f"Error writing file: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save file")
-
-    # Save file metadata
-    file_id = str(uuid.uuid4())
-    db.files.insert_one({
-        "_id": file_id,
-        "spaceId": space_id,
-        "path": filepath,
-        "filename": file.filename,
-        "type": file.content_type or "application/octet-stream",
-        "size": len(content),
-        "uploadedBy": current_user["_id"],
-        "uploadedAt": datetime.now(timezone.utc)
-    })
-
-    # Get all files for this space and ingest
-    ingestion_status = "success"
-    if rag_engine:
+        # Read file content in chunks for better memory management
+        MAX_SIZE = 10 * 1024 * 1024  # 10MB
+        content_chunks = []
+        total_size = 0
+        
+        logger.info(f"Reading file content: {file.filename}")
+        
+        while True:
+            chunk = await file.read(1024 * 1024)  # Read 1MB at a time
+            if not chunk:
+                break
+            total_size += len(chunk)
+            
+            # Check size limit
+            if total_size > MAX_SIZE:
+                logger.warning(f"File too large: {file.filename}, size: {total_size} bytes")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"File too large ({total_size:,} bytes). Maximum size is 10MB."
+                )
+            
+            content_chunks.append(chunk)
+        
+        if total_size == 0:
+            logger.warning(f"Empty file uploaded: {file.filename}")
+            raise HTTPException(status_code=400, detail="File is empty")
+        
+        logger.info(f"File read complete: {file.filename}, size: {total_size:,} bytes")
+        
+        # Combine chunks
+        content = b"".join(content_chunks)
+        
+        # Generate unique filename
+        filename = f"{uuid.uuid4()}{file_ext}"
+        filepath = os.path.join(UPLOAD_DIR, filename)
+        
+        logger.info(f"Saving file to: {filepath}")
+        
+        # Save file
         try:
-            space_files = [f["path"] for f in db.files.find({"spaceId": space_id})]
-            if space_files:
-                rag_engine.ingest(space_files, space_id, llm)
+            with open(filepath, "wb") as f:
+                f.write(content)
+            logger.info(f"File saved successfully: {filepath}")
         except Exception as e:
-            logger.error(f"Ingestion error: {e}")
-            ingestion_status = f"partial - {str(e)}"
-    else:
-        ingestion_status = "skipped - RAG Engine not available"
+            logger.error(f"Error writing file {filepath}: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to save file: {str(e)}"
+            )
 
-    return {
-        "message": "File uploaded successfully",
-        "file_id": file_id,
-        "filename": file.filename,
-        "size": len(content),
-        "ingestion_status": ingestion_status
-    }
+        # Save file metadata
+        file_id = str(uuid.uuid4())
+        file_doc = {
+            "_id": file_id,
+            "spaceId": space_id,
+            "path": filepath,
+            "filename": file.filename,
+            "original_filename": file.filename,
+            "type": file.content_type or "application/octet-stream",
+            "size": total_size,
+            "uploadedBy": current_user["_id"],
+            "uploadedByUsername": current_user.get("username"),
+            "uploadedAt": datetime.now(timezone.utc),
+            "extension": file_ext,
+            "status": "uploaded"
+        }
+        
+        logger.info(f"Saving file metadata: {file_id}")
+        db.files.insert_one(file_doc)
+        logger.info(f"File metadata saved: {file_id}")
 
+        # Get all files for this space and ingest
+        ingestion_status = "pending"
+        ingestion_error = None
+        
+        if rag_engine:
+            try:
+                logger.info(f"Starting RAG ingestion for space: {space_id}")
+                logger.info(f"Processing file: {file.filename}")
+                
+                # Update status to processing
+                db.files.update_one(
+                    {"_id": file_id},
+                    {"$set": {"status": "processing", "processing_started": datetime.now(timezone.utc)}}
+                )
+                
+                space_files = [f["path"] for f in db.files.find({"spaceId": space_id})]
+                if space_files:
+                    logger.info(f"Ingesting {len(space_files)} files for space {space_id}")
+                    rag_engine.ingest(space_files, space_id, llm)
+                    ingestion_status = "success"
+                    logger.info(f"RAG ingestion successful for space: {space_id}")
+                else:
+                    ingestion_status = "no_files"
+                    logger.warning(f"No files to ingest for space: {space_id}")
+                    
+            except Exception as e:
+                ingestion_status = "failed"
+                ingestion_error = str(e)
+                logger.error(f"Ingestion error for space {space_id}: {e}", exc_info=True)
+        else:
+            ingestion_status = "skipped"
+            logger.warning("RAG Engine not available - ingestion skipped")
+
+        # Update final status
+        db.files.update_one(
+            {"_id": file_id},
+            {
+                "$set": {
+                    "status": ingestion_status,
+                    "ingestion_status": ingestion_status,
+                    "ingestion_error": ingestion_error,
+                    "processing_completed": datetime.now(timezone.utc)
+                }
+            }
+        )
+
+        # Prepare detailed response
+        response_data = {
+            "message": "File uploaded successfully",
+            "file_id": file_id,
+            "filename": file.filename,
+            "original_filename": file.filename,
+            "size": total_size,
+            "size_formatted": f"{total_size:,} bytes",
+            "type": file.content_type or "application/octet-stream",
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            "uploaded_by": {
+                "id": current_user["_id"],
+                "username": current_user.get("username")
+            },
+            "ingestion": {
+                "status": ingestion_status,
+                "message": f"Ingestion {ingestion_status}"
+            }
+        }
+        
+        if ingestion_error:
+            response_data["ingestion"]["error"] = ingestion_error
+        
+        logger.info(f"Upload completed successfully: {file.filename} -> {file_id}")
+        logger.debug(f"Response data: {response_data}")
+        
+        return response_data
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during upload: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Upload failed: {str(e)}"
+        )
 
 
 

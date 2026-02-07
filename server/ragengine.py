@@ -24,6 +24,7 @@ CHUNK_SIZE = 400
 # RAG ENGINE CLASS
 ############################################
 
+
 class RAGEngine:
     """Class-based RAG engine to avoid global state management issues."""
 
@@ -34,7 +35,7 @@ class RAGEngine:
         # Initialize models
         self.embedder = SentenceTransformer("all-MiniLM-L6-v2")
         self.reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self.ocr_reader = easyocr.Reader(['en'], gpu=False)
+        self.ocr_reader = easyocr.Reader(["en"], gpu=False)
 
         # Initialize Neo4j driver
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
@@ -45,7 +46,7 @@ class RAGEngine:
             self.driver,
             index_name="chunk_embedding_index",
             embedder=graph_embedder,
-            return_properties=["text", "space"]
+            return_properties=["text", "space"],
         )
 
         # Space-aware BM25 storage (maps space_id -> BM25 instance)
@@ -62,18 +63,24 @@ class RAGEngine:
         try:
             with self.driver.session() as session:
                 # Create vector index for chunks
-                session.run("""
+                session.run(
+                    """
                 CREATE VECTOR INDEX chunk_embedding_index IF NOT EXISTS
                 FOR (c:Chunk) ON (c.embedding)
                 OPTIONS {indexConfig: {
                     `vector.dimensions`: 384,
                     `vector.similarity_function`: 'cosine'
                 }}
-                """)
+                """
+                )
 
                 # Create indexes for space filtering
-                session.run("CREATE INDEX space_index IF NOT EXISTS FOR (c:Chunk) ON (c.space)")
-                session.run("CREATE INDEX concept_space_index IF NOT EXISTS FOR (c:Concept) ON (c.space)")
+                session.run(
+                    "CREATE INDEX space_index IF NOT EXISTS FOR (c:Chunk) ON (c.space)"
+                )
+                session.run(
+                    "CREATE INDEX concept_space_index IF NOT EXISTS FOR (c:Concept) ON (c.space)"
+                )
                 logger.info("✅ Indexes created/verified")
         except Exception as e:
             logger.warning(f"Index creation warning: {e}")
@@ -87,7 +94,10 @@ class RAGEngine:
         if not text:
             return []
         words = text.split()
-        return [" ".join(words[i:i + CHUNK_SIZE]) for i in range(0, len(words), CHUNK_SIZE)]
+        return [
+            " ".join(words[i : i + CHUNK_SIZE])
+            for i in range(0, len(words), CHUNK_SIZE)
+        ]
 
     def read_pdf(self, path: str) -> str:
         """Extract text from PDF file."""
@@ -112,7 +122,7 @@ class RAGEngine:
     def read_txt(self, path: str) -> str:
         """Read text file."""
         try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read().strip()
         except Exception as e:
             logger.error(f"Error reading text file {path}: {e}")
@@ -128,31 +138,54 @@ class RAGEngine:
             return {"concepts": [], "edges": []}
 
         prompt = f"""
-Extract key concepts and their prerequisite relationships from the following text.
-Return a JSON object with exactly this structure:
-{{
-    "concepts": ["concept1", "concept2", ...],
-    "edges": [["prerequisite", "requires", "dependent"], ...]
-}}
+    Extract key concepts and their prerequisite relationships from the following text.
+    Return a JSON object with exactly this structure:
+    {{
+        "concepts": ["concept1", "concept2", ...],
+        "edges": [["prerequisite", "requires", "dependent"], ...]
+    }}
 
-Text: {text[:2000]}
+    Important: Return ONLY valid JSON, no additional text or markdown.
 
-Return only valid JSON, no additional text."""
+    Text: {text[:2000]}
+
+    JSON:"""
 
         try:
             response = llm_func(prompt)
 
             # Clean response
             response = response.strip()
+            
+            # Remove markdown code blocks if present
             if response.startswith("```json"):
                 response = response[7:]
-            if response.startswith("```"):
+            elif response.startswith("```"):
                 response = response[3:]
+            
             if response.endswith("```"):
                 response = response[:-3]
+            
             response = response.strip()
-
-            result = json.loads(response)
+            
+            # Try to find JSON object in response
+            import re
+            
+            # Look for JSON object pattern
+            json_pattern = r'\{[^{}]*\}'
+            json_matches = re.findall(json_pattern, response, re.DOTALL)
+            
+            if json_matches:
+                # Use the first JSON-like object found
+                json_str = json_matches[0]
+                result = json.loads(json_str)
+            else:
+                # If no JSON object found, try to parse the whole response
+                try:
+                    result = json.loads(response)
+                except json.JSONDecodeError:
+                    logger.warning(f"Could not parse JSON from response: {response[:200]}...")
+                    return {"concepts": [], "edges": []}
 
             # Validate structure
             if not isinstance(result.get("concepts", []), list):
@@ -161,29 +194,43 @@ Return only valid JSON, no additional text."""
                 result["edges"] = []
 
             # Clean concepts
-            result["concepts"] = [c.strip() for c in result["concepts"] if c and isinstance(c, str)]
+            clean_concepts = []
+            for concept in result["concepts"]:
+                if isinstance(concept, str) and concept.strip():
+                    clean_concepts.append(concept.strip())
+                elif isinstance(concept, (int, float)):
+                    clean_concepts.append(str(concept))
+            
+            result["concepts"] = clean_concepts
 
             # Validate edges
             valid_edges = []
             for edge in result["edges"]:
                 if isinstance(edge, (list, tuple)) and len(edge) >= 3:
                     try:
-                        source = str(edge[0]).strip()
-                        rel = str(edge[1]).strip()
-                        target = str(edge[2]).strip()
+                        source = str(edge[0]).strip() if edge[0] is not None else ""
+                        rel = str(edge[1]).strip() if edge[1] is not None else ""
+                        target = str(edge[2]).strip() if edge[2] is not None else ""
                         if source and rel and target:
                             valid_edges.append([source, rel, target])
                     except Exception:
                         continue
+            
             result["edges"] = valid_edges
 
+            logger.debug(f"Extracted {len(result['concepts'])} concepts and {len(result['edges'])} edges")
             return result
+            
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error in concept extraction: {e}")
+            logger.debug(f"Response that failed: {response[:500] if 'response' in locals() else 'No response'}")
             return {"concepts": [], "edges": []}
         except Exception as e:
             logger.error(f"Error extracting concepts: {e}")
             return {"concepts": [], "edges": []}
+
+
+
 
     ############################################
     # GRAPH OPERATIONS
@@ -193,6 +240,8 @@ Return only valid JSON, no additional text."""
         """Generate unique chunk ID using hash (more collision-resistant than simple hash)."""
         content = f"{space}_{chunk}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
+    
+    
 
     def insert_graph(self, chunk: str, embedding: List[float], space: str, llm_func):
         """Insert chunk and extracted concepts into Neo4j graph."""
@@ -216,7 +265,7 @@ Return only valid JSON, no additional text."""
                     })
                 """,
                 text=chunk,
-                embedding=embedding,
+                embedding=embedding,  # Now this is a Python list, not tensor
                 space=space,
                 chunk_id=chunk_id)
 
@@ -246,8 +295,11 @@ Return only valid JSON, no additional text."""
                             MERGE (a)-[r:RELATED_TO {type: $rel}]->(b)
                             SET r.strength = coalesce(r.strength, 0) + 1
                         """, source=source, target=target, rel=rel, space=space)
+                        
         except Exception as e:
             logger.error(f"Error inserting graph data: {e}")
+            # Log the embedding type for debugging
+            logger.debug(f"Embedding type: {type(embedding)}, first few values: {embedding[:3] if embedding else 'None'}")
 
     ############################################
     # INGESTION
@@ -264,7 +316,12 @@ Return only valid JSON, no additional text."""
         # Clear existing data for this space
         try:
             with self.driver.session() as session:
-                session.run("MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space)
+                session.run(
+                    "MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space
+                )
+                session.run(
+                    "MATCH (c:Concept {space: $space}) DETACH DELETE c", space=space
+                )
         except Exception as e:
             logger.warning(f"Error clearing old chunks: {e}")
 
@@ -277,11 +334,13 @@ Return only valid JSON, no additional text."""
 
             try:
                 # Extract text based on file type
-                if file_path.lower().endswith('.pdf'):
+                if file_path.lower().endswith(".pdf"):
                     text = self.read_pdf(file_path)
-                elif file_path.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                elif file_path.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".bmp")
+                ):
                     text = self.read_image(file_path)
-                elif file_path.lower().endswith('.txt'):
+                elif file_path.lower().endswith(".txt"):
                     text = self.read_txt(file_path)
                 else:
                     logger.warning(f"Unsupported file type: {file_path}")
@@ -295,7 +354,9 @@ Return only valid JSON, no additional text."""
                 chunks = self.chunk_text(text)
                 if chunks:
                     all_chunks.extend(chunks)
-                    logger.info(f"Extracted {len(chunks)} chunks from {os.path.basename(file_path)}")
+                    logger.info(
+                        f"Extracted {len(chunks)} chunks from {os.path.basename(file_path)}"
+                    )
 
             except Exception as e:
                 logger.error(f"Error processing {file_path}: {e}")
@@ -313,20 +374,34 @@ Return only valid JSON, no additional text."""
         try:
             # Generate embeddings
             logger.info(f"Generating embeddings for {len(all_chunks)} chunks")
-            embeddings = self.embedder.encode(all_chunks, convert_to_numpy=False)
-            if not isinstance(embeddings, list):
-                embeddings = embeddings.tolist()
+
+            # Generate embeddings with numpy arrays
+            embeddings = self.embedder.encode(
+                all_chunks, convert_to_tensor=False
+            )  # Already returns numpy
+
+            # Convert embeddings to Python lists for Neo4j
+            embeddings_list = []
+            for emb in embeddings:
+                if hasattr(emb, "tolist"):
+                    embeddings_list.append(emb.tolist())
+                elif hasattr(emb, "numpy"):
+                    embeddings_list.append(emb.numpy().tolist())
+                else:
+                    embeddings_list.append(list(emb))
 
             # Insert into graph
             logger.info("Inserting chunks into graph...")
-            for chunk, embedding in zip(all_chunks, embeddings):
+            for chunk, embedding in zip(all_chunks, embeddings_list):
                 self.insert_graph(chunk, embedding, space, llm_func)
 
             # Update space-specific BM25
             self.space_documents[space] = all_chunks
             self.space_bm25[space] = BM25Okapi([doc.split() for doc in all_chunks])
 
-            logger.info(f"✅ Successfully ingested {len(all_chunks)} chunks into space {space}")
+            logger.info(
+                f"✅ Successfully ingested {len(all_chunks)} chunks into space {space}"
+            )
         except Exception as e:
             logger.error(f"Error during ingestion: {e}")
             raise
@@ -354,31 +429,32 @@ Return only valid JSON, no additional text."""
                 logger.warning(f"BM25 retrieval error: {e}")
 
         # Vector retrieval with space filtering
-        if self.retriever:
-            try:
-                query_vector = self.embedder.encode(query)
-                if not isinstance(query_vector, list):
-                    query_vector = query_vector.tolist()
+        try:
+            query_vector = self.embedder.encode(query, convert_to_tensor=False)
+            if hasattr(query_vector, 'tolist'):
+                query_vector = query_vector.tolist()
+            elif hasattr(query_vector, 'numpy'):
+                query_vector = query_vector.numpy().tolist()
 
-                with self.driver.session() as session:
-                    result = session.run("""
-                        CALL db.index.vector.queryNodes('chunk_embedding_index', $top_k, $query_vector)
-                        YIELD node, score
-                        WHERE node.space = $space
-                        RETURN node.text AS text, score
-                        ORDER BY score DESC
-                        LIMIT $top_k
-                    """,
-                    top_k=TOP_K,
-                    query_vector=query_vector,
-                    space=space)
+            with self.driver.session() as session:
+                result = session.run("""
+                    CALL db.index.vector.queryNodes('chunk_embedding_index', $top_k, $query_vector)
+                    YIELD node, score
+                    WHERE node.space = $space
+                    RETURN node.text AS text, score
+                    ORDER BY score DESC
+                    LIMIT $top_k
+                """,
+                top_k=TOP_K,
+                query_vector=query_vector,
+                space=space)
 
-                    for record in result:
-                        text = record["text"]
-                        if text:
-                            hits.append(text)
-            except Exception as e:
-                logger.warning(f"Vector retrieval error: {e}")
+                for record in result:
+                    text = record["text"]
+                    if text:
+                        hits.append(text)
+        except Exception as e:
+            logger.warning(f"Vector retrieval error: {e}")
 
         # Remove duplicates while preserving order
         seen = set()
@@ -433,7 +509,9 @@ Return only valid JSON, no additional text."""
             return "I couldn't find relevant information to answer your question."
 
         # Prepare context
-        context = "\n\n".join([f"Document {i+1}: {doc}" for i, doc in enumerate(relevant_docs[:3])])
+        context = "\n\n".join(
+            [f"Document {i+1}: {doc}" for i, doc in enumerate(relevant_docs[:3])]
+        )
 
         # Generate answer using LLM
         prompt = f"""Based on the following context from study materials, answer the question clearly and concisely.
@@ -462,8 +540,12 @@ Provide a clear, detailed answer based only on the context above:"""
         """Clear all data for a specific space."""
         try:
             with self.driver.session() as session:
-                session.run("MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space)
-                session.run("MATCH (c:Concept {space: $space}) DETACH DELETE c", space=space)
+                session.run(
+                    "MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space
+                )
+                session.run(
+                    "MATCH (c:Concept {space: $space}) DETACH DELETE c", space=space
+                )
 
             # Clear space-specific indexes
             if space in self.space_bm25:
@@ -481,24 +563,24 @@ Provide a clear, detailed answer based only on the context above:"""
             with self.driver.session() as session:
                 chunk_count = session.run(
                     "MATCH (c:Chunk {space: $space}) RETURN count(c) as count",
-                    space=space
+                    space=space,
                 ).single()["count"]
 
                 concept_count = session.run(
                     "MATCH (c:Concept {space: $space}) RETURN count(c) as count",
-                    space=space
+                    space=space,
                 ).single()["count"]
 
                 rel_count = session.run(
                     "MATCH (a:Concept {space: $space})-[r]->(b:Concept {space: $space}) RETURN count(r) as count",
-                    space=space
+                    space=space,
                 ).single()["count"]
 
             return {
                 "chunks": chunk_count,
                 "concepts": concept_count,
                 "relationships": rel_count,
-                "space": space
+                "space": space,
             }
         except Exception as e:
             logger.error(f"Error getting space stats: {e}")
