@@ -5,12 +5,12 @@ import { useParams } from 'next/navigation';
 import { ProtectedRoute } from '@/components/Layout/ProtectedRoute';
 import { Card } from '@/components/UI/Card';
 import { Button } from '@/components/UI/Button';
-import { ChatWindow } from '@/components/Chat/ChatWindow';
-import { FileUploader } from '@/components/Chat/FileUploader';
+import { ChatWindow } from '@/components/chat/ChatWindow';
+import { FileUploader } from '@/components/chat/FileUploader';
 import { ChatMessage, StudySpace, File as FileType, SpaceStats } from '@/types';
 import { api } from '@/lib/api';
 import { formatDate, formatFileSize } from '@/lib/utils';
-import { LoadingSpinner } from '@/components/UI/LoadingSpinner';
+import { LoadingSpinner } from '@/components/UI/LoadSpinner';
 
 export default function SpaceDetailPage() {
   const { id } = useParams();

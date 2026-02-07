@@ -6,7 +6,9 @@ import { ProtectedRoute } from '@/components/Layout/ProtectedRoute';
 import { Card } from '@/components/UI/Card';
 import { Input } from '@/components/UI/Input';
 import { Button } from '@/components/UI/Button';
-import { api } from '@/lib/api';
+import { api, extractErrorMessage } from '@/lib/api';
+
+ 
 
 export default function CreateSpacePage() {
   const router = useRouter();
@@ -33,7 +35,9 @@ export default function CreateSpacePage() {
       const response = await api.post('/spaces', formData);
       router.push(`/spaces/${response.data.space_id}`);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create space');
+      // Use the extractErrorMessage helper
+      const errorMessage = extractErrorMessage(err);
+      setError(errorMessage);
     } finally {
       setLoading(false);
     }

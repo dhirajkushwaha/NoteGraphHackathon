@@ -385,36 +385,90 @@ async def list_spaces(
 
 @app.post("/spaces", tags=["StudySpaces"])
 async def create_space(
-    subject: str = Form(...),
-    topic: Optional[str] = Form(None),
+    space_data: dict = Body(...),
     current_user: dict = Depends(get_current_user)
 ):
     """Create a new study space."""
+    
+    logger.info(f"Creating new study space for user: {current_user['_id']} ({current_user['username']})")
+    logger.info(f"Request data: subject={space_data.get('subject')}, topic={space_data.get('topic')}")
+    logger.debug(f"Full request data: {space_data}")
 
-    if not subject:
-        raise HTTPException(status_code=400, detail="Subject is required")
+    try:
+        subject = space_data.get("subject")
+        topic = space_data.get("topic")
+        
+        if not subject:
+            logger.warning(f"Missing subject field for user {current_user['_id']}")
+            logger.warning(f"Received data: {space_data}")
+            raise HTTPException(status_code=400, detail="Subject is required")
+        
+        # Validate subject length
+        if len(subject.strip()) == 0:
+            logger.warning(f"Empty subject field for user {current_user['_id']}")
+            raise HTTPException(status_code=400, detail="Subject cannot be empty or just whitespace")
+        
+        if len(subject) > 200:
+            logger.warning(f"Subject too long ({len(subject)} chars) for user {current_user['_id']}")
+            raise HTTPException(status_code=400, detail="Subject is too long (max 200 characters)")
+        
+        # Validate topic length if provided
+        if topic and len(topic) > 200:
+            logger.warning(f"Topic too long ({len(topic)} chars) for user {current_user['_id']}")
+            raise HTTPException(status_code=400, detail="Topic is too long (max 200 characters)")
 
-    space_id = str(uuid.uuid4())
-
-    db.studyspaces.insert_one({
-        "_id": space_id,
-        "subject": subject,
-        "topic": topic,
-        "users": [current_user["_id"]],
-        "created_by": current_user["_id"],
-        "createdAt": datetime.now(timezone.utc)
-    })
-
-    return {
-        "message": "Study space created successfully",
-        "space_id": space_id,
-        "space": {
-            "id": space_id,
-            "subject": subject,
-            "topic": topic,
-            "users": [current_user["_id"]]
+        space_id = str(uuid.uuid4())
+        
+        logger.info(f"Generated space ID: {space_id}")
+        
+        # Prepare document for insertion
+        space_doc = {
+            "_id": space_id,
+            "subject": subject.strip(),
+            "topic": topic.strip() if topic else None,
+            "users": [current_user["_id"]],
+            "created_by": current_user["_id"],
+            "createdAt": datetime.now(timezone.utc)
         }
-    }
+        
+        logger.debug(f"Space document to insert: {space_doc}")
+        
+        # Insert into database
+        result = db.studyspaces.insert_one(space_doc)
+        
+        logger.info(f"Space created successfully: {space_id}")
+        logger.info(f"MongoDB insert result: inserted_id={result.inserted_id}")
+
+        # Prepare response
+        response_data = {
+            "message": "Study space created successfully",
+            "space_id": space_id,
+            "space": {
+                "id": space_id,
+                "subject": subject.strip(),
+                "topic": topic.strip() if topic else None,
+                "users": [current_user["_id"]]
+            }
+        }
+        
+        logger.info(f"Returning response for space: {space_id}")
+        logger.debug(f"Response data: {response_data}")
+        
+        return response_data
+        
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error creating study space for user {current_user['_id']}: {e}", exc_info=True)
+        logger.error(f"Stack trace for debugging:")
+        import traceback
+        logger.error(traceback.format_exc())
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to create study space: {str(e)}"
+        )
 
 @app.get("/spaces/{space_id}", tags=["StudySpaces"])
 async def get_space(
@@ -435,6 +489,8 @@ async def get_space(
     space["createdAt"] = space["createdAt"].isoformat() if space.get("createdAt") else None
 
     return space
+
+
 
 @app.delete("/spaces/{space_id}", tags=["StudySpaces"])
 async def delete_space(
@@ -576,6 +632,9 @@ async def upload_file(
         "size": len(content),
         "ingestion_status": ingestion_status
     }
+
+
+
 
 @app.delete("/spaces/{space_id}/files/{file_id}", tags=["Files"])
 async def delete_file(

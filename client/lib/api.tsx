@@ -36,3 +36,26 @@ api.interceptors.response.use(
     return Promise.reject(error);
   }
 );
+
+
+
+// Helper function to extract error message from FastAPI responses
+export function extractErrorMessage(error: any): string {
+  if (!error) return 'An unknown error occurred';
+  
+  // FastAPI validation errors
+  if (error.response?.data?.detail) {
+    if (Array.isArray(error.response.data.detail)) {
+      return error.response.data.detail[0]?.msg || 'Validation error';
+    }
+    return error.response.data.detail;
+  }
+  
+  // General API errors
+  if (error.response?.data?.error) {
+    return error.response.data.error;
+  }
+  
+  // Network or other errors
+  return error.message || 'An error occurred';
+}
