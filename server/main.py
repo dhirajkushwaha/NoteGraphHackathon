@@ -13,6 +13,10 @@ from bson import ObjectId
 from ragengine import RAGEngine
 from models import User, StudySpace, File as FileModel, Chat
 
+from rank_bm25 import BM25Okapi
+
+
+
 ############################################
 # ENV
 ############################################
@@ -563,7 +567,7 @@ async def upload_file(
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user)
 ):
-    """Upload file to study space with detailed progress tracking."""
+    """Upload file to study space with incremental ingestion and progress tracking."""
     
     logger.info(f"File upload started for space: {space_id}")
     logger.info(f"Uploaded by user: {current_user['_id']} ({current_user['username']})")
@@ -647,7 +651,7 @@ async def upload_file(
                 detail=f"Failed to save file: {str(e)}"
             )
 
-        # Save file metadata
+        # Save file metadata with progress tracking
         file_id = str(uuid.uuid4())
         file_doc = {
             "_id": file_id,
@@ -661,47 +665,156 @@ async def upload_file(
             "uploadedByUsername": current_user.get("username"),
             "uploadedAt": datetime.now(timezone.utc),
             "extension": file_ext,
-            "status": "uploaded"
+            "status": "uploaded",
+            "processed": False,  # Track if RAG processed it
+            "chunks_count": 0,   # Track how many chunks extracted
+            "processing_stage": "uploaded",  # Track processing stage
+            "processing_started": None,
+            "processing_completed": None,
+            "ingestion_status": "pending",
+            "ingestion_error": None,
+            "embeddings_generated": False,
+            "concepts_extracted": False,
+            "neo4j_stored": False
         }
         
         logger.info(f"Saving file metadata: {file_id}")
-        db.files.insert_one(file_doc)
-        logger.info(f"File metadata saved: {file_id}")
+        result = db.files.insert_one(file_doc)
+        logger.info(f"File metadata saved: {file_id}, MongoDB ID: {result.inserted_id}")
 
-        # Get all files for this space and ingest
+        # INCREMENTAL ingestion - only process the new file
         ingestion_status = "pending"
         ingestion_error = None
+        chunks_extracted = 0
+        processing_details = {}
         
         if rag_engine:
             try:
-                logger.info(f"Starting RAG ingestion for space: {space_id}")
-                logger.info(f"Processing file: {file.filename}")
+                logger.info(f"Starting INCREMENTAL RAG ingestion for space: {space_id}")
+                logger.info(f"Processing only new file: {file.filename}")
                 
-                # Update status to processing
+                # Update status to processing started
                 db.files.update_one(
                     {"_id": file_id},
-                    {"$set": {"status": "processing", "processing_started": datetime.now(timezone.utc)}}
+                    {"$set": {
+                        "status": "processing",
+                        "processing_stage": "text_extraction",
+                        "processing_started": datetime.now(timezone.utc)
+                    }}
                 )
                 
-                space_files = [f["path"] for f in db.files.find({"spaceId": space_id})]
-                if space_files:
-                    logger.info(f"Ingesting {len(space_files)} files for space {space_id}")
-                    rag_engine.ingest(space_files, space_id, llm)
-                    ingestion_status = "success"
-                    logger.info(f"RAG ingestion successful for space: {space_id}")
+                # Step 1: Extract text from the new file
+                logger.info(f"Extracting text from: {file.filename}")
+                text = ""
+                if filepath.lower().endswith(".pdf"):
+                    text = rag_engine.read_pdf(filepath)
+                elif filepath.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp')):
+                    text = rag_engine.read_image(filepath)
+                elif filepath.lower().endswith(".txt"):
+                    text = rag_engine.read_txt(filepath)
+                
+                if not text.strip():
+                    raise HTTPException(status_code=400, detail="No text extracted from file")
+                
+                # Update: text extracted
+                db.files.update_one(
+                    {"_id": file_id},
+                    {"$set": {"processing_stage": "chunking"}}
+                )
+                
+                # Step 2: Chunk the text
+                logger.info(f"Chunking text from: {file.filename}")
+                chunks = rag_engine.chunk_text(text)
+                chunks_extracted = len(chunks)
+                
+                db.files.update_one(
+                    {"_id": file_id},
+                    {"$set": {
+                        "chunks_count": chunks_extracted,
+                        "processing_stage": "embedding_generation"
+                    }}
+                )
+                logger.info(f"Extracted {chunks_extracted} chunks from {file.filename}")
+                
+                if not chunks:
+                    ingestion_status = "no_chunks"
+                    logger.warning(f"No chunks extracted from: {file.filename}")
                 else:
-                    ingestion_status = "no_files"
-                    logger.warning(f"No files to ingest for space: {space_id}")
+                    # Step 3: Generate embeddings (incremental - only for new chunks)
+                    logger.info(f"Generating embeddings for {chunks_extracted} new chunks")
+                    embeddings = rag_engine.embedder.encode(chunks, convert_to_tensor=False)
+                    
+                    # Convert to lists for Neo4j
+                    embeddings_list = []
+                    for emb in embeddings:
+                        if hasattr(emb, "tolist"):
+                            embeddings_list.append(emb.tolist())
+                        elif hasattr(emb, "numpy"):
+                            embeddings_list.append(emb.numpy().tolist())
+                        else:
+                            embeddings_list.append(list(emb))
+                    
+                    db.files.update_one(
+                        {"_id": file_id},
+                        {"$set": {
+                            "embeddings_generated": True,
+                            "processing_stage": "graph_insertion"
+                        }}
+                    )
+                    
+                    # Step 4: Insert into Neo4j (incremental - no clearing of existing data)
+                    logger.info("Inserting new chunks into Neo4j graph (incremental)...")
+                    for chunk, embedding in zip(chunks, embeddings_list):
+                        rag_engine.insert_graph(chunk, embedding, space_id, llm)
+                    
+                    db.files.update_one(
+                        {"_id": file_id},
+                        {"$set": {
+                            "concepts_extracted": True,
+                            "neo4j_stored": True,
+                            "processing_stage": "indexing"
+                        }}
+                    )
+                    
+                    # Step 5: Update BM25 index (append new chunks to existing)
+                    logger.info("Updating BM25 index with new chunks...")
+                    if space_id in rag_engine.space_documents:
+                        # Append new chunks to existing documents
+                        rag_engine.space_documents[space_id].extend(chunks)
+                    else:
+                        # Create new if first time
+                        rag_engine.space_documents[space_id] = chunks
+                    
+                    # Recreate BM25 with ALL documents (existing + new)
+                    rag_engine.space_bm25[space_id] = BM25Okapi(
+                        [doc.split() for doc in rag_engine.space_documents[space_id]]
+                    )
+                    
+                    ingestion_status = "success"
+                    logger.info(f"✅ INCREMENTAL ingestion successful: {chunks_extracted} new chunks added to space {space_id}")
+                    
+                    processing_details = {
+                        "chunks_extracted": chunks_extracted,
+                        "embeddings_generated": len(embeddings_list),
+                        "space_total_chunks": len(rag_engine.space_documents.get(space_id, [])),
+                        "processing_time": None  # Will be set below
+                    }
                     
             except Exception as e:
                 ingestion_status = "failed"
                 ingestion_error = str(e)
-                logger.error(f"Ingestion error for space {space_id}: {e}", exc_info=True)
+                logger.error(f"Incremental ingestion error for space {space_id}: {e}", exc_info=True)
         else:
             ingestion_status = "skipped"
             logger.warning("RAG Engine not available - ingestion skipped")
 
-        # Update final status
+        # Update final status with processing time
+        processing_completed = datetime.now(timezone.utc)
+        if file_doc.get("processing_started"):
+            processing_time = (processing_completed - file_doc["processing_started"]).total_seconds()
+        else:
+            processing_time = 0
+        
         db.files.update_one(
             {"_id": file_id},
             {
@@ -709,7 +822,11 @@ async def upload_file(
                     "status": ingestion_status,
                     "ingestion_status": ingestion_status,
                     "ingestion_error": ingestion_error,
-                    "processing_completed": datetime.now(timezone.utc)
+                    "processed": ingestion_status == "success",
+                    "processing_stage": "completed",
+                    "processing_completed": processing_completed,
+                    "processing_time_seconds": processing_time,
+                    "processing_details": processing_details
                 }
             }
         )
@@ -730,14 +847,18 @@ async def upload_file(
             },
             "ingestion": {
                 "status": ingestion_status,
-                "message": f"Ingestion {ingestion_status}"
-            }
+                "message": f"Incremental ingestion {ingestion_status}",
+                "chunks_extracted": chunks_extracted,
+                "processing_time_seconds": processing_time
+            },
+            "processing_details": processing_details
         }
         
         if ingestion_error:
             response_data["ingestion"]["error"] = ingestion_error
+            response_data["ingestion"]["error_details"] = str(ingestion_error)
         
-        logger.info(f"Upload completed successfully: {file.filename} -> {file_id}")
+        logger.info(f"Upload completed: {file.filename} -> {file_id}, Status: {ingestion_status}")
         logger.debug(f"Response data: {response_data}")
         
         return response_data
@@ -753,49 +874,130 @@ async def upload_file(
         )
 
 
-
 @app.delete("/spaces/{space_id}/files/{file_id}", tags=["Files"])
 async def delete_file(
     space_id: str,
     file_id: str,
     current_user: dict = Depends(get_current_user)
 ):
-    """Delete file from study space."""
+    """Delete file from study space with complete re-ingestion."""
+    
+    logger.info(f"File deletion requested: space={space_id}, file={file_id}")
+    logger.info(f"Requested by user: {current_user['_id']} ({current_user['username']})")
 
     space = db.studyspaces.find_one({"_id": space_id})
     if not space:
+        logger.warning(f"Space not found for deletion: {space_id}")
         raise HTTPException(status_code=404, detail="Study space not found")
 
     if current_user["_id"] not in space.get("users", []):
+        logger.warning(f"Unauthorized deletion attempt: User {current_user['_id']} in space {space_id}")
         raise HTTPException(status_code=403, detail="Not authorized")
 
     file = db.files.find_one({"_id": file_id, "spaceId": space_id})
     if not file:
+        logger.warning(f"File not found: {file_id} in space {space_id}")
         raise HTTPException(status_code=404, detail="File not found")
 
-    # Delete physical file
-    file_path = file.get("path")
-    if file_path and os.path.exists(file_path):
+    try:
+        # Mark file as deleting for tracking
+        db.files.update_one(
+            {"_id": file_id},
+            {"$set": {
+                "status": "deleting",
+                "deletion_started": datetime.now(timezone.utc),
+                "deleted_by": current_user["_id"]
+            }}
+        )
+        
+        # Delete physical file
+        file_path = file.get("path")
+        physical_deleted = False
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                physical_deleted = True
+                logger.info(f"Physical file deleted: {file_path}")
+            except Exception as e:
+                logger.warning(f"Error deleting physical file {file_path}: {e}")
+                physical_deleted = False
+        
+        # Delete from database
+        db.files.delete_one({"_id": file_id})
+        logger.info(f"File metadata deleted from MongoDB: {file_id}")
+        
+        # Update deletion status
+        deletion_status = "completed" if physical_deleted else "partial"
+        
+        # Re-ingest remaining files (FULL re-ingestion needed after deletion)
+        reingestion_status = "skipped"
+        reingestion_error = None
+        
+        if rag_engine:
+            try:
+                logger.info(f"Starting FULL re-ingestion for space {space_id} after file deletion")
+                
+                # Get remaining files
+                space_files = [f["path"] for f in db.files.find({"spaceId": space_id})]
+                
+                if space_files:
+                    logger.info(f"Re-ingesting {len(space_files)} remaining files for space {space_id}")
+                    
+                    # Clear existing Neo4j data for this space (needed when deleting)
+                    rag_engine.clear_space(space_id)
+                    logger.info(f"Cleared Neo4j data for space {space_id}")
+                    
+                    # Re-ingest ALL remaining files
+                    rag_engine.ingest(space_files, space_id, llm, clear_existing=False)
+                    
+                    reingestion_status = "success"
+                    logger.info(f"✅ Re-ingestion successful for space {space_id}")
+                else:
+                    # No files left, just clear the space
+                    rag_engine.clear_space(space_id)
+                    reingestion_status = "cleared"
+                    logger.info(f"Space {space_id} cleared (no files remaining)")
+                    
+            except Exception as e:
+                reingestion_status = "failed"
+                reingestion_error = str(e)
+                logger.error(f"Re-ingestion error for space {space_id}: {e}", exc_info=True)
+        
+        # Log deletion summary
+        logger.info(f"File deletion completed: {file_id}, Status: {deletion_status}, Re-ingestion: {reingestion_status}")
+        
+        return {
+            "message": "File deleted successfully",
+            "file_id": file_id,
+            "filename": file.get("filename"),
+            "physical_deleted": physical_deleted,
+            "metadata_deleted": True,
+            "deletion_status": deletion_status,
+            "reingestion_status": reingestion_status,
+            "remaining_files": db.files.count_documents({"spaceId": space_id})
+        }
+        
+    except Exception as e:
+        logger.error(f"Error during file deletion: {e}", exc_info=True)
+        # Try to restore status if deletion failed
         try:
-            os.remove(file_path)
-        except Exception as e:
-            logger.warning(f"Error deleting file {file_path}: {e}")
+            db.files.update_one(
+                {"_id": file_id},
+                {"$set": {
+                    "status": "error",
+                    "deletion_error": str(e),
+                    "deletion_completed": datetime.now(timezone.utc)
+                }}
+            )
+        except:
+            pass
+            
+        raise HTTPException(
+            status_code=500,
+            detail=f"File deletion failed: {str(e)}"
+        )
 
-    # Delete from database
-    db.files.delete_one({"_id": file_id})
 
-    # Re-ingest remaining files
-    if rag_engine:
-        try:
-            space_files = [f["path"] for f in db.files.find({"spaceId": space_id})]
-            if space_files:
-                rag_engine.ingest(space_files, space_id, llm)
-            else:
-                rag_engine.clear_space(space_id)
-        except Exception as e:
-            logger.error(f"Re-ingestion error: {e}")
-
-    return {"message": "File deleted successfully"}
 
 ############################################
 # Chat Endpoints

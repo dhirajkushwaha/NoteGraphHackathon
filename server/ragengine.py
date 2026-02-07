@@ -8,6 +8,8 @@ from neo4j import GraphDatabase
 from neo4j_graphrag.retrievers import VectorRetriever
 from neo4j_graphrag.embeddings import SentenceTransformerEmbeddings
 from typing import List, Dict, Any, Optional
+from rank_bm25 import BM25Okapi
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -156,25 +158,25 @@ class RAGEngine:
 
             # Clean response
             response = response.strip()
-            
+
             # Remove markdown code blocks if present
             if response.startswith("```json"):
                 response = response[7:]
             elif response.startswith("```"):
                 response = response[3:]
-            
+
             if response.endswith("```"):
                 response = response[:-3]
-            
+
             response = response.strip()
-            
+
             # Try to find JSON object in response
             import re
-            
+
             # Look for JSON object pattern
-            json_pattern = r'\{[^{}]*\}'
+            json_pattern = r"\{[^{}]*\}"
             json_matches = re.findall(json_pattern, response, re.DOTALL)
-            
+
             if json_matches:
                 # Use the first JSON-like object found
                 json_str = json_matches[0]
@@ -184,7 +186,9 @@ class RAGEngine:
                 try:
                     result = json.loads(response)
                 except json.JSONDecodeError:
-                    logger.warning(f"Could not parse JSON from response: {response[:200]}...")
+                    logger.warning(
+                        f"Could not parse JSON from response: {response[:200]}..."
+                    )
                     return {"concepts": [], "edges": []}
 
             # Validate structure
@@ -200,7 +204,7 @@ class RAGEngine:
                     clean_concepts.append(concept.strip())
                 elif isinstance(concept, (int, float)):
                     clean_concepts.append(str(concept))
-            
+
             result["concepts"] = clean_concepts
 
             # Validate edges
@@ -215,22 +219,23 @@ class RAGEngine:
                             valid_edges.append([source, rel, target])
                     except Exception:
                         continue
-            
+
             result["edges"] = valid_edges
 
-            logger.debug(f"Extracted {len(result['concepts'])} concepts and {len(result['edges'])} edges")
+            logger.debug(
+                f"Extracted {len(result['concepts'])} concepts and {len(result['edges'])} edges"
+            )
             return result
-            
+
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error in concept extraction: {e}")
-            logger.debug(f"Response that failed: {response[:500] if 'response' in locals() else 'No response'}")
+            logger.debug(
+                f"Response that failed: {response[:500] if 'response' in locals() else 'No response'}"
+            )
             return {"concepts": [], "edges": []}
         except Exception as e:
             logger.error(f"Error extracting concepts: {e}")
             return {"concepts": [], "edges": []}
-
-
-
 
     ############################################
     # GRAPH OPERATIONS
@@ -240,8 +245,6 @@ class RAGEngine:
         """Generate unique chunk ID using hash (more collision-resistant than simple hash)."""
         content = f"{space}_{chunk}"
         return hashlib.sha256(content.encode()).hexdigest()[:16]
-    
-    
 
     def insert_graph(self, chunk: str, embedding: List[float], space: str, llm_func):
         """Insert chunk and extracted concepts into Neo4j graph."""
@@ -256,7 +259,8 @@ class RAGEngine:
 
             with self.driver.session() as session:
                 # Create chunk node
-                session.run("""
+                session.run(
+                    """
                     CREATE (c:Chunk {
                         text: $text,
                         embedding: $embedding,
@@ -264,66 +268,75 @@ class RAGEngine:
                         chunk_id: $chunk_id
                     })
                 """,
-                text=chunk,
-                embedding=embedding,  # Now this is a Python list, not tensor
-                space=space,
-                chunk_id=chunk_id)
+                    text=chunk,
+                    embedding=embedding,  # Now this is a Python list, not tensor
+                    space=space,
+                    chunk_id=chunk_id,
+                )
 
                 # Create concept nodes and relationships
                 for concept_name in concepts_data["concepts"]:
                     if concept_name:
-                        session.run("""
+                        session.run(
+                            """
                             MERGE (concept:Concept {name: $name, space: $space})
                             ON CREATE SET concept.created_at = timestamp()
-                        """, name=concept_name, space=space)
+                        """,
+                            name=concept_name,
+                            space=space,
+                        )
 
                         # Link concept to chunk
-                        session.run("""
+                        session.run(
+                            """
                             MATCH (concept:Concept {name: $concept_name, space: $space})
                             MATCH (chunk:Chunk {chunk_id: $chunk_id})
                             MERGE (concept)-[:EXPLAINED_BY]->(chunk)
-                        """, concept_name=concept_name, space=space, chunk_id=chunk_id)
+                        """,
+                            concept_name=concept_name,
+                            space=space,
+                            chunk_id=chunk_id,
+                        )
 
                 # Create prerequisite relationships
                 for edge in concepts_data["edges"]:
                     if len(edge) >= 3:
                         source, rel, target = edge[0], edge[1], edge[2]
 
-                        session.run("""
+                        session.run(
+                            """
                             MATCH (a:Concept {name: $source, space: $space})
                             MATCH (b:Concept {name: $target, space: $space})
                             MERGE (a)-[r:RELATED_TO {type: $rel}]->(b)
                             SET r.strength = coalesce(r.strength, 0) + 1
-                        """, source=source, target=target, rel=rel, space=space)
-                        
+                        """,
+                            source=source,
+                            target=target,
+                            rel=rel,
+                            space=space,
+                        )
+
         except Exception as e:
             logger.error(f"Error inserting graph data: {e}")
             # Log the embedding type for debugging
-            logger.debug(f"Embedding type: {type(embedding)}, first few values: {embedding[:3] if embedding else 'None'}")
+            logger.debug(
+                f"Embedding type: {type(embedding)}, first few values: {embedding[:3] if embedding else 'None'}"
+            )
 
     ############################################
     # INGESTION
     ############################################
 
-    def ingest(self, files: List[str], space: str, llm_func):
-        """Ingest files into the knowledge graph for a specific space."""
+
+    # Add this method to your RAGEngine class:
+
+    def ingest_incremental(self, files: List[str], space: str, llm_func):
+        """Ingest only new files incrementally without deleting existing data."""
         if not files:
-            logger.warning("No files provided for ingestion")
+            logger.warning("No files provided for incremental ingestion")
             return
 
-        logger.info(f"Ingesting {len(files)} files into space: {space}")
-
-        # Clear existing data for this space
-        try:
-            with self.driver.session() as session:
-                session.run(
-                    "MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space
-                )
-                session.run(
-                    "MATCH (c:Concept {space: $space}) DETACH DELETE c", space=space
-                )
-        except Exception as e:
-            logger.warning(f"Error clearing old chunks: {e}")
+        logger.info(f"Incrementally ingesting {len(files)} files into space: {space}")
 
         all_chunks = []
 
@@ -336,9 +349,114 @@ class RAGEngine:
                 # Extract text based on file type
                 if file_path.lower().endswith(".pdf"):
                     text = self.read_pdf(file_path)
-                elif file_path.lower().endswith(
-                    (".png", ".jpg", ".jpeg", ".gif", ".bmp")
-                ):
+                elif file_path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                    text = self.read_image(file_path)
+                elif file_path.lower().endswith(".txt"):
+                    text = self.read_txt(file_path)
+                else:
+                    logger.warning(f"Unsupported file type: {file_path}")
+                    continue
+
+                if not text.strip():
+                    logger.warning(f"No text extracted from: {file_path}")
+                    continue
+
+                # Chunk the text
+                chunks = self.chunk_text(text)
+                if chunks:
+                    all_chunks.extend(chunks)
+                    logger.info(
+                        f"Extracted {len(chunks)} chunks from {os.path.basename(file_path)}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+                continue
+
+        if not all_chunks:
+            logger.error(f"No chunks extracted from new files for space {space}")
+            return
+
+        try:
+            # Generate embeddings for new chunks only
+            logger.info(f"Generating embeddings for {len(all_chunks)} new chunks")
+
+            # Generate embeddings with numpy arrays
+            embeddings = self.embedder.encode(all_chunks, convert_to_tensor=False)
+
+            # Convert embeddings to Python lists for Neo4j
+            embeddings_list = []
+            for emb in embeddings:
+                if hasattr(emb, "tolist"):
+                    embeddings_list.append(emb.tolist())
+                elif hasattr(emb, "numpy"):
+                    embeddings_list.append(emb.numpy().tolist())
+                else:
+                    embeddings_list.append(list(emb))
+
+            # Insert into graph (NO deletion of existing data)
+            logger.info("Inserting new chunks into graph...")
+            for chunk, embedding in zip(all_chunks, embeddings_list):
+                self.insert_graph(chunk, embedding, space, llm_func)
+
+            # Update space-specific BM25 with NEW chunks
+            if space in self.space_documents:
+                # Append new chunks to existing documents
+                self.space_documents[space].extend(all_chunks)
+            else:
+                # Create new BM25 index if this is the first ingestion
+                self.space_documents[space] = all_chunks
+
+            # Recreate BM25 with ALL documents (existing + new)
+            self.space_bm25[space] = BM25Okapi(
+                [doc.split() for doc in self.space_documents[space]]
+            )
+
+            logger.info(
+                f"✅ Successfully ingested {len(all_chunks)} new chunks into space {space}"
+            )
+        except Exception as e:
+            logger.error(f"Error during incremental ingestion: {e}")
+            raise
+
+
+    # Also update the existing ingest method to optionally not clear data:
+    def ingest(self, files: List[str], space: str, llm_func, clear_existing: bool = True):
+        """Ingest files into the knowledge graph for a specific space."""
+        if not files:
+            logger.warning("No files provided for ingestion")
+            return
+
+        logger.info(f"Ingesting {len(files)} files into space: {space}")
+
+        # Clear existing data for this space ONLY if requested
+        if clear_existing:
+            try:
+                with self.driver.session() as session:
+                    session.run(
+                        "MATCH (c:Chunk {space: $space}) DETACH DELETE c", space=space
+                    )
+                    session.run(
+                        "MATCH (c:Concept {space: $space}) DETACH DELETE c", space=space
+                    )
+                logger.info(f"Cleared existing data for space: {space}")
+            except Exception as e:
+                logger.warning(f"Error clearing old chunks: {e}")
+        else:
+            logger.info(f"Skipping data clearance for incremental update")
+
+        all_chunks = []
+
+        for file_path in files:
+            if not os.path.exists(file_path):
+                logger.warning(f"File not found: {file_path}")
+                continue
+
+            try:
+                # Extract text based on file type
+                if file_path.lower().endswith(".pdf"):
+                    text = self.read_pdf(file_path)
+                elif file_path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
                     text = self.read_image(file_path)
                 elif file_path.lower().endswith(".txt"):
                     text = self.read_txt(file_path)
@@ -364,11 +482,12 @@ class RAGEngine:
 
         if not all_chunks:
             logger.error(f"No chunks extracted from files for space {space}")
-            # Clear space-specific indexes
-            if space in self.space_bm25:
-                del self.space_bm25[space]
-            if space in self.space_documents:
-                del self.space_documents[space]
+            # Clear space-specific indexes only if we cleared data
+            if clear_existing:
+                if space in self.space_bm25:
+                    del self.space_bm25[space]
+                if space in self.space_documents:
+                    del self.space_documents[space]
             return
 
         try:
@@ -376,9 +495,7 @@ class RAGEngine:
             logger.info(f"Generating embeddings for {len(all_chunks)} chunks")
 
             # Generate embeddings with numpy arrays
-            embeddings = self.embedder.encode(
-                all_chunks, convert_to_tensor=False
-            )  # Already returns numpy
+            embeddings = self.embedder.encode(all_chunks, convert_to_tensor=False)
 
             # Convert embeddings to Python lists for Neo4j
             embeddings_list = []
@@ -396,8 +513,20 @@ class RAGEngine:
                 self.insert_graph(chunk, embedding, space, llm_func)
 
             # Update space-specific BM25
-            self.space_documents[space] = all_chunks
-            self.space_bm25[space] = BM25Okapi([doc.split() for doc in all_chunks])
+            if clear_existing:
+                # Replace with new documents
+                self.space_documents[space] = all_chunks
+                self.space_bm25[space] = BM25Okapi([doc.split() for doc in all_chunks])
+            else:
+                # Append to existing documents
+                if space in self.space_documents:
+                    self.space_documents[space].extend(all_chunks)
+                else:
+                    self.space_documents[space] = all_chunks
+                # Recreate BM25 with ALL documents
+                self.space_bm25[space] = BM25Okapi(
+                    [doc.split() for doc in self.space_documents[space]]
+                )
 
             logger.info(
                 f"✅ Successfully ingested {len(all_chunks)} chunks into space {space}"
@@ -431,13 +560,14 @@ class RAGEngine:
         # Vector retrieval with space filtering
         try:
             query_vector = self.embedder.encode(query, convert_to_tensor=False)
-            if hasattr(query_vector, 'tolist'):
+            if hasattr(query_vector, "tolist"):
                 query_vector = query_vector.tolist()
-            elif hasattr(query_vector, 'numpy'):
+            elif hasattr(query_vector, "numpy"):
                 query_vector = query_vector.numpy().tolist()
 
             with self.driver.session() as session:
-                result = session.run("""
+                result = session.run(
+                    """
                     CALL db.index.vector.queryNodes('chunk_embedding_index', $top_k, $query_vector)
                     YIELD node, score
                     WHERE node.space = $space
@@ -445,9 +575,10 @@ class RAGEngine:
                     ORDER BY score DESC
                     LIMIT $top_k
                 """,
-                top_k=TOP_K,
-                query_vector=query_vector,
-                space=space)
+                    top_k=TOP_K,
+                    query_vector=query_vector,
+                    space=space,
+                )
 
                 for record in result:
                     text = record["text"]
@@ -464,7 +595,7 @@ class RAGEngine:
                 seen.add(hit)
                 unique_hits.append(hit)
 
-        return unique_hits[:TOP_K * 2]
+        return unique_hits[: TOP_K * 2]
 
     ############################################
     # RERANKING AND ANSWERING
