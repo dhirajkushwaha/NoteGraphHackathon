@@ -39,28 +39,28 @@
     multiplier?: number;
   }
 
-  type ImpactItem = [string, string, string];
+  // type ImpactItem = [string, string, string];
 
-const impact: ImpactItem[] = [
-  [
-    "BroadcastPro Manufacturer Awards 2025 - Best in AI Winner",
-    "Plan-itU recognized for transformative AI-driven automation in linear broadcast content planning and operations.",
-    "/img/elements/cardimg.png",
-  ],
+// const impact: ImpactItem[] = [
+//   [
+//     "BroadcastPro Manufacturer Awards 2025 - Best in AI Winner",
+//     "Plan-itU recognized for transformative AI-driven automation in linear broadcast content planning and operations.",
+//     "/img/elements/cardimg.png",
+//   ],
 
-  [
-    "Powering Sony Pictures Networks India Cloud Journey",
-    "Successfully implemented BroadView in AWS cloud for SPNI, setting new standards for enterprise-scale migrations.",
-    "/img/elements/cardimg-sony.png",
-  ],
+//   [
+//     "Powering Sony Pictures Networks India Cloud Journey",
+//     "Successfully implemented BroadView in AWS cloud for SPNI, setting new standards for enterprise-scale migrations.",
+//     "/img/elements/cardimg-sony.png",
+//   ],
 
-  [
-    "Industry Leadership",
-    "Featured at NAB 2023, The Broadcast Bridge, and Broadcast & CableSat for pioneering solutions that redefine media operations.",
-    "/img/elements/cardimg-industry.png",
-  ],
-  ["", "", ""],
-] as const;
+//   [
+//     "Industry Leadership",
+//     "Featured at NAB 2023, The Broadcast Bridge, and Broadcast & CableSat for pioneering solutions that redefine media operations.",
+//     "/img/elements/cardimg-industry.png",
+//   ],
+//   ["", "", ""],
+// ] as const;
 
 
 export default function Home() {
@@ -78,15 +78,15 @@ export default function Home() {
 
   const { openPopup } = usePopup();
 
-  const trustedByImages = [
-    "/img/trustedby/1 (1).png",
-    "/img/trustedby/1 (2).png",
-    "/img/trustedby/1 (3).png",
-    "/img/trustedby/1 (4).png",
-    "/img/trustedby/1 (5).png",
-    "/img/trustedby/1 (6).png",
-    "/img/trustedby/1 (7).png",
-  ];
+  // const trustedByImages = [
+  //   "/img/trustedby/1 (1).png",
+  //   "/img/trustedby/1 (2).png",
+  //   "/img/trustedby/1 (3).png",
+  //   "/img/trustedby/1 (4).png",
+  //   "/img/trustedby/1 (5).png",
+  //   "/img/trustedby/1 (6).png",
+  //   "/img/trustedby/1 (7).png",
+  // ];
 
   useGSAP(() => {
     if (typeof window === "undefined") return;
@@ -386,15 +386,15 @@ export default function Home() {
 
     const trackWidth = track?.offsetWidth;
 
-    gsap.to(".trustedBy-logo", {
-      x: `-=${trackWidth}`, // shift by one full track
-      duration: 40,
-      ease: "linear",
-      repeat: -1,
-      modifiers: {
-        x: gsap.utils.unitize((x) => parseFloat(x) % -trackWidth!), // reset smoothly
-      },
-    });
+    // gsap.to(".trustedBy-logo", {
+    //   x: `-=${trackWidth}`, // shift by one full track
+    //   duration: 40,
+    //   ease: "linear",
+    //   repeat: -1,
+    //   modifiers: {
+    //     x: gsap.utils.unitize((x) => parseFloat(x) % -trackWidth!), // reset smoothly
+    //   },
+    // });
 
 
 
