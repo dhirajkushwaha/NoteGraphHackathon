@@ -83,8 +83,36 @@ class Quiz(BaseModel):
     score: int = Field(default=0, ge=0)
     createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
+
+
+    
+# Add these to your models.py or create new Pydantic models in main.py
+
+
+
+class PostGroup(BaseModel):
+    """Group for organizing posts (like discussion rooms)."""
+    name: str = Field(..., min_length=1, max_length=100)
+    description: Optional[str] = Field(None, max_length=500)
+    is_public: bool = Field(default=True)
+    created_by: Optional[str] = None
+    members: List[str] = []  # User IDs
+    moderators: List[str] = []  # User IDs
+    createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator('name')
+    def validate_name(cls, v):
+        """Validate group name."""
+        if not v.strip():
+            raise ValueError('Group name cannot be empty')
+        return v.strip()
+
+
+# Update the existing Post model to include group reference
 class Post(BaseModel):
     """Study group post model."""
+    groupId: str  # Reference to PostGroup
     userId: str
     title: str = Field(..., min_length=1, max_length=300)
     content: str = Field(..., min_length=1)
@@ -92,6 +120,8 @@ class Post(BaseModel):
     upvotes: int = Field(default=0, ge=0)
     downvotes: int = Field(default=0, ge=0)
     comments: List[Dict[str, Any]] = []
+    tags: List[str] = Field(default_factory=list)
+    is_pinned: bool = Field(default=False)
     createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
     @field_validator('title')
@@ -106,4 +136,22 @@ class Post(BaseModel):
         """Validate post content."""
         if not v.strip():
             raise ValueError('Content cannot be empty')
+        return v.strip()
+
+
+class Comment(BaseModel):
+    """Comment on a post."""
+    postId: str
+    userId: str
+    content: str = Field(..., min_length=1)
+    parentCommentId: Optional[str] = None  # For nested comments
+    upvotes: int = Field(default=0, ge=0)
+    downvotes: int = Field(default=0, ge=0)
+    createdAt: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @field_validator('content')
+    def validate_content(cls, v):
+        """Validate comment content."""
+        if not v.strip():
+            raise ValueError('Comment cannot be empty')
         return v.strip()

@@ -687,6 +687,7 @@ async def upload_file(
         ingestion_error = None
         chunks_extracted = 0
         processing_details = {}
+        bm25_status = "not_attempted"
         
         if rag_engine:
             try:
@@ -776,19 +777,53 @@ async def upload_file(
                         }}
                     )
                     
-                    # Step 5: Update BM25 index (append new chunks to existing)
+                    # Step 5: Update BM25 index (append new chunks to existing) - WITH ERROR HANDLING
                     logger.info("Updating BM25 index with new chunks...")
-                    if space_id in rag_engine.space_documents:
-                        # Append new chunks to existing documents
-                        rag_engine.space_documents[space_id].extend(chunks)
-                    else:
-                        # Create new if first time
-                        rag_engine.space_documents[space_id] = chunks
+                    try:
+                        if space_id in rag_engine.space_documents:
+                            # Append new chunks to existing documents
+                            rag_engine.space_documents[space_id].extend(chunks)
+                            logger.info(f"Appended {len(chunks)} chunks to existing BM25 index for space {space_id}")
+                        else:
+                            # Create new if first time
+                            rag_engine.space_documents[space_id] = chunks
+                            logger.info(f"Created new BM25 index for space {space_id} with {len(chunks)} chunks")
+                        
+                        # Try to create BM25 index with error handling
+                        try:
+                            # Import BM25Okapi with error handling
+                            try:
+                                from rank_bm25 import BM25Okapi
+                                
+                                # Tokenize documents for BM25
+                                tokenized_docs = [doc.split() for doc in rag_engine.space_documents[space_id]]
+                                
+                                # Create BM25 index
+                                rag_engine.space_bm25[space_id] = BM25Okapi(tokenized_docs)
+                                bm25_status = "success"
+                                logger.info(f"✅ BM25 index created/updated for space {space_id} with {len(tokenized_docs)} documents")
+                                
+                            except ImportError as import_error:
+                                bm25_status = "import_failed"
+                                rag_engine.space_bm25[space_id] = None
+                                logger.warning(f"BM25Okapi import failed, skipping BM25 indexing: {import_error}")
+                                logger.warning("Vector search will still work, but keyword search (BM25) will be limited")
+                                
+                            except Exception as bm25_error:
+                                bm25_status = "creation_failed"
+                                rag_engine.space_bm25[space_id] = None
+                                logger.warning(f"BM25 index creation failed: {bm25_error}")
+                                logger.warning("Continuing without BM25 - vector search will still work")
+                                
+                        except Exception as e:
+                            bm25_status = "error"
+                            logger.warning(f"BM25 update error (non-critical): {e}")
+                            # Don't fail the whole ingestion because of BM25
                     
-                    # Recreate BM25 with ALL documents (existing + new)
-                    rag_engine.space_bm25[space_id] = BM25Okapi(
-                        [doc.split() for doc in rag_engine.space_documents[space_id]]
-                    )
+                    except Exception as e:
+                        bm25_status = "failed"
+                        logger.warning(f"BM25 update failed (non-critical): {e}")
+                        # Continue anyway - Neo4j vector search will still work
                     
                     ingestion_status = "success"
                     logger.info(f"✅ INCREMENTAL ingestion successful: {chunks_extracted} new chunks added to space {space_id}")
@@ -797,6 +832,7 @@ async def upload_file(
                         "chunks_extracted": chunks_extracted,
                         "embeddings_generated": len(embeddings_list),
                         "space_total_chunks": len(rag_engine.space_documents.get(space_id, [])),
+                        "bm25_status": bm25_status,
                         "processing_time": None  # Will be set below
                     }
                     
@@ -804,6 +840,14 @@ async def upload_file(
                 ingestion_status = "failed"
                 ingestion_error = str(e)
                 logger.error(f"Incremental ingestion error for space {space_id}: {e}", exc_info=True)
+                
+                # Check if it's a BM25-specific error
+                if "BM25Okapi" in str(e) or "BM25" in str(e):
+                    logger.warning("BM25-related error detected, but Neo4j data might still be saved")
+                    # Check if Neo4j data was saved before the error
+                    if chunks_extracted > 0:
+                        ingestion_status = "partial_success"
+                        ingestion_error = f"File processed but BM25 indexing failed: {str(e)}"
         else:
             ingestion_status = "skipped"
             logger.warning("RAG Engine not available - ingestion skipped")
@@ -815,6 +859,9 @@ async def upload_file(
         else:
             processing_time = 0
         
+        # Determine if file was actually processed (even if BM25 failed)
+        was_processed = ingestion_status in ["success", "partial_success"] and chunks_extracted > 0
+        
         db.files.update_one(
             {"_id": file_id},
             {
@@ -822,18 +869,28 @@ async def upload_file(
                     "status": ingestion_status,
                     "ingestion_status": ingestion_status,
                     "ingestion_error": ingestion_error,
-                    "processed": ingestion_status == "success",
+                    "processed": was_processed,
                     "processing_stage": "completed",
                     "processing_completed": processing_completed,
                     "processing_time_seconds": processing_time,
-                    "processing_details": processing_details
+                    "processing_details": processing_details,
+                    "bm25_status": bm25_status
                 }
             }
         )
 
-        # Prepare detailed response
+        # Prepare detailed response based on ingestion status
+        if ingestion_status == "success":
+            message = "File uploaded and processed successfully"
+        elif ingestion_status == "partial_success":
+            message = "File uploaded and content processed, but some indexing features may be limited"
+        elif ingestion_status == "failed":
+            message = "File uploaded but processing failed"
+        else:
+            message = "File uploaded successfully"
+        
         response_data = {
-            "message": "File uploaded successfully",
+            "message": message,
             "file_id": file_id,
             "filename": file.filename,
             "original_filename": file.filename,
@@ -849,16 +906,16 @@ async def upload_file(
                 "status": ingestion_status,
                 "message": f"Incremental ingestion {ingestion_status}",
                 "chunks_extracted": chunks_extracted,
-                "processing_time_seconds": processing_time
+                "processing_time_seconds": processing_time,
+                "bm25_status": bm25_status
             },
             "processing_details": processing_details
         }
         
         if ingestion_error:
             response_data["ingestion"]["error"] = ingestion_error
-            response_data["ingestion"]["error_details"] = str(ingestion_error)
         
-        logger.info(f"Upload completed: {file.filename} -> {file_id}, Status: {ingestion_status}")
+        logger.info(f"Upload completed: {file.filename} -> {file_id}, Status: {ingestion_status}, BM25: {bm25_status}")
         logger.debug(f"Response data: {response_data}")
         
         return response_data
@@ -872,7 +929,6 @@ async def upload_file(
             status_code=500, 
             detail=f"Upload failed: {str(e)}"
         )
-
 
 @app.delete("/spaces/{space_id}/files/{file_id}", tags=["Files"])
 async def delete_file(
@@ -1192,11 +1248,22 @@ async def startup_event():
         db.studyspaces.create_index("users")
         db.files.create_index("spaceId")
         db.chats.create_index("spaceId")
+        
+        # New indexes for posts feature
+        db.postgroups.create_index("name", unique=True)
+        db.postgroups.create_index("members")
+        db.postgroups.create_index("is_public")
+        db.posts.create_index("groupId")
+        db.posts.create_index("userId")
+        db.posts.create_index([("groupId", 1), ("createdAt", -1)])
+        db.posts.create_index([("groupId", 1), ("upvotes", -1)])
+        
         logger.info("✅ Database indexes created")
     except Exception as e:
         logger.warning(f"Error creating indexes: {e}")
 
     logger.info("✅ Startup complete")
+    
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -1210,3 +1277,751 @@ async def shutdown_event():
         logger.info("✅ Shutdown complete")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################
+# StudySpace User Management Endpoints
+############################################
+
+@app.get("/spaces/{space_id}/users", tags=["StudySpaces"])
+async def get_space_users(
+    space_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get all users in a study space."""
+    
+    space = db.studyspaces.find_one({"_id": space_id})
+    if not space:
+        raise HTTPException(status_code=404, detail="Study space not found")
+    
+    # Check if current user is in space
+    if current_user["_id"] not in space.get("users", []):
+        raise HTTPException(status_code=403, detail="Not authorized")
+    
+    # Get user details for all users in space
+    user_ids = space.get("users", [])
+    users = list(db.users.find({"_id": {"$in": user_ids}}))
+    
+    # Format response
+    formatted_users = []
+    for user in users:
+        formatted_users.append({
+            "id": user["_id"],
+            "username": user["username"],
+            "email": user["email"],
+            "is_owner": user["_id"] == space.get("created_by"),
+            "added_at": space.get("createdAt")  # Note: we should track when users were added
+        })
+    
+    return {
+        "space_id": space_id,
+        "users": formatted_users,
+        "total": len(formatted_users)
+    }
+
+
+@app.post("/spaces/{space_id}/users", tags=["StudySpaces"])
+async def add_user_to_space(
+    space_id: str,
+    username_or_email: str = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user)
+):
+    """Add a user to study space by username or email."""
+    
+    space = db.studyspaces.find_one({"_id": space_id})
+    if not space:
+        raise HTTPException(status_code=404, detail="Study space not found")
+    
+    # Check if current user is space owner/creator
+    if current_user["_id"] != space.get("created_by"):
+        raise HTTPException(status_code=403, detail="Only space owner can add users")
+    
+    # Find user by username or email
+    user_to_add = db.users.find_one({
+        "$or": [
+            {"username": username_or_email},
+            {"email": username_or_email}
+        ]
+    })
+    
+    if not user_to_add:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = user_to_add["_id"]
+    
+    # Check if user is already in space
+    if user_id in space.get("users", []):
+        raise HTTPException(status_code=400, detail="User already in space")
+    
+    # Check if trying to add yourself
+    if user_id == current_user["_id"]:
+        raise HTTPException(status_code=400, detail="You are already in this space")
+    
+    # Add user to space
+    result = db.studyspaces.update_one(
+        {"_id": space_id},
+        {"$addToSet": {"users": user_id}}  # Using $addToSet to prevent duplicates
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to add user to space")
+    
+    logger.info(f"User {user_id} added to space {space_id} by {current_user['_id']}")
+    
+    return {
+        "message": "User added to space successfully",
+        "space_id": space_id,
+        "user": {
+            "id": user_id,
+            "username": user_to_add["username"],
+            "email": user_to_add["email"]
+        }
+    }
+
+
+@app.delete("/spaces/{space_id}/users/{user_id}", tags=["StudySpaces"])
+async def remove_user_from_space(
+    space_id: str,
+    user_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Remove a user from study space."""
+    
+    space = db.studyspaces.find_one({"_id": space_id})
+    if not space:
+        raise HTTPException(status_code=404, detail="Study space not found")
+    
+    # Check if current user is space owner/creator
+    if current_user["_id"] != space.get("created_by"):
+        raise HTTPException(status_code=403, detail="Only space owner can remove users")
+    
+    # Check if trying to remove owner
+    if user_id == space.get("created_by"):
+        raise HTTPException(status_code=400, detail="Cannot remove space owner")
+    
+    # Check if user is in space
+    if user_id not in space.get("users", []):
+        raise HTTPException(status_code=400, detail="User not in space")
+    
+    # Remove user from space
+    result = db.studyspaces.update_one(
+        {"_id": space_id},
+        {"$pull": {"users": user_id}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to remove user from space")
+    
+    logger.info(f"User {user_id} removed from space {space_id} by {current_user['_id']}")
+    
+    return {
+        "message": "User removed from space successfully",
+        "space_id": space_id,
+        "user_id": user_id
+    }
+
+
+@app.post("/spaces/{space_id}/leave", tags=["StudySpaces"])
+async def leave_space(
+    space_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Leave a study space (remove yourself)."""
+    
+    space = db.studyspaces.find_one({"_id": space_id})
+    if not space:
+        raise HTTPException(status_code=404, detail="Study space not found")
+    
+    # Check if user is in space
+    if current_user["_id"] not in space.get("users", []):
+        raise HTTPException(status_code=400, detail="You are not in this space")
+    
+    # Check if user is owner
+    if current_user["_id"] == space.get("created_by"):
+        raise HTTPException(status_code=400, detail="Space owner cannot leave. Transfer ownership or delete space.")
+    
+    # Remove user from space
+    result = db.studyspaces.update_one(
+        {"_id": space_id},
+        {"$pull": {"users": current_user["_id"]}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to leave space")
+    
+    logger.info(f"User {current_user['_id']} left space {space_id}")
+    
+    return {
+        "message": "Left space successfully",
+        "space_id": space_id
+    }
+    
+    
+    
+    
+    
+    
+    ############################################
+# Post Groups Endpoints
+############################################
+
+@app.get("/groups", tags=["Posts"])
+async def list_groups(
+    current_user: dict = Depends(get_current_user),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    public_only: bool = Query(False)
+):
+    """List post groups (discussion rooms)."""
+    
+    query = {}
+    
+    if public_only:
+        query["is_public"] = True
+    else:
+        # Show public groups + groups user is member of
+        query["$or"] = [
+            {"is_public": True},
+            {"members": current_user["_id"]},
+            {"moderators": current_user["_id"]},
+            {"created_by": current_user["_id"]}
+        ]
+    
+    groups = list(db.postgroups.find(query)
+                  .sort("createdAt", -1)
+                  .skip(skip)
+                  .limit(limit))
+    
+    # Get user info for creators
+    for group in groups:
+        group["_id"] = str(group["_id"])
+        group["createdAt"] = group["createdAt"].isoformat() if group.get("createdAt") else None
+        
+        # Get creator info
+        creator = db.users.find_one({"_id": group.get("created_by")})
+        if creator:
+            group["created_by_user"] = {
+                "id": creator["_id"],
+                "username": creator["username"]
+            }
+        
+        # Check if current user is member
+        group["is_member"] = current_user["_id"] in group.get("members", [])
+        group["is_moderator"] = current_user["_id"] in group.get("moderators", [])
+        group["is_creator"] = current_user["_id"] == group.get("created_by")
+    
+    return {"groups": groups, "count": len(groups)}
+
+
+@app.post("/groups", tags=["Posts"])
+async def create_group(
+    group_data: dict = Body(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new post group (discussion room)."""
+    
+    name = group_data.get("name")
+    description = group_data.get("description")
+    is_public = group_data.get("is_public", True)
+    
+    if not name:
+        raise HTTPException(status_code=400, detail="Group name is required")
+    
+    # Check if group name already exists
+    existing = db.postgroups.find_one({"name": name})
+    if existing:
+        raise HTTPException(status_code=400, detail="Group name already exists")
+    
+    group_id = str(uuid.uuid4())
+    
+    group_doc = {
+        "_id": group_id,
+        "name": name.strip(),
+        "description": description.strip() if description else None,
+        "is_public": is_public,
+        "created_by": current_user["_id"],
+        "members": [current_user["_id"]],  # Creator is automatically a member
+        "moderators": [current_user["_id"]],  # Creator is automatically a moderator
+        "createdAt": datetime.now(timezone.utc)
+    }
+    
+    db.postgroups.insert_one(group_doc)
+    
+    logger.info(f"Group created: {group_id} by {current_user['_id']}")
+    
+    return {
+        "message": "Group created successfully",
+        "group_id": group_id,
+        "group": {
+            "id": group_id,
+            "name": name.strip(),
+            "description": description,
+            "is_public": is_public,
+            "created_by": current_user["_id"]
+        }
+    }
+
+
+@app.get("/groups/{group_id}", tags=["Posts"])
+async def get_group(
+    group_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get group details."""
+    
+    group = db.postgroups.find_one({"_id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check access for private groups
+    if not group.get("is_public", True):
+        if (current_user["_id"] not in group.get("members", []) and
+            current_user["_id"] not in group.get("moderators", []) and
+            current_user["_id"] != group.get("created_by")):
+            raise HTTPException(status_code=403, detail="Not authorized to access this group")
+    
+    group["_id"] = str(group["_id"])
+    group["createdAt"] = group["createdAt"].isoformat() if group.get("createdAt") else None
+    
+    # Get creator info
+    creator = db.users.find_one({"_id": group.get("created_by")})
+    if creator:
+        group["created_by_user"] = {
+            "id": creator["_id"],
+            "username": creator["username"]
+        }
+    
+    # Get member info
+    member_ids = group.get("members", [])
+    moderator_ids = group.get("moderators", [])
+    
+    all_user_ids = list(set(member_ids + moderator_ids + [group.get("created_by")]))
+    users = list(db.users.find({"_id": {"$in": all_user_ids}}))
+    
+    user_map = {user["_id"]: user for user in users}
+    
+    # Format members
+    formatted_members = []
+    for member_id in member_ids:
+        if member_id in user_map:
+            formatted_members.append({
+                "id": member_id,
+                "username": user_map[member_id]["username"],
+                "email": user_map[member_id]["email"],
+                "role": "moderator" if member_id in moderator_ids else "member",
+                "is_creator": member_id == group.get("created_by")
+            })
+    
+    group["members"] = formatted_members
+    group["member_count"] = len(formatted_members)
+    
+    # Check current user's role
+    group["current_user_role"] = "non_member"
+    if current_user["_id"] == group.get("created_by"):
+        group["current_user_role"] = "creator"
+    elif current_user["_id"] in moderator_ids:
+        group["current_user_role"] = "moderator"
+    elif current_user["_id"] in member_ids:
+        group["current_user_role"] = "member"
+    
+    return group
+
+
+@app.post("/groups/{group_id}/join", tags=["Posts"])
+async def join_group(
+    group_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Join a group."""
+    
+    group = db.postgroups.find_one({"_id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check if already a member
+    if current_user["_id"] in group.get("members", []):
+        raise HTTPException(status_code=400, detail="Already a member of this group")
+    
+    # Add user to members
+    result = db.postgroups.update_one(
+        {"_id": group_id},
+        {"$addToSet": {"members": current_user["_id"]}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to join group")
+    
+    logger.info(f"User {current_user['_id']} joined group {group_id}")
+    
+    return {
+        "message": "Joined group successfully",
+        "group_id": group_id
+    }
+
+
+@app.post("/groups/{group_id}/leave", tags=["Posts"])
+async def leave_group(
+    group_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Leave a group."""
+    
+    group = db.postgroups.find_one({"_id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check if user is creator
+    if current_user["_id"] == group.get("created_by"):
+        raise HTTPException(status_code=400, detail="Group creator cannot leave. Delete group or transfer ownership.")
+    
+    # Check if user is a member
+    if current_user["_id"] not in group.get("members", []):
+        raise HTTPException(status_code=400, detail="Not a member of this group")  # FIXED HERE
+    
+    # Remove from members and moderators
+    result = db.postgroups.update_one(
+        {"_id": group_id},
+        {
+            "$pull": {
+                "members": current_user["_id"],
+                "moderators": current_user["_id"]
+            }
+        }
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to leave group")
+    
+    logger.info(f"User {current_user['_id']} left group {group_id}")
+    
+    return {
+        "message": "Left group successfully",
+        "group_id": group_id
+    }
+
+
+
+############################################
+# Posts Endpoints
+############################################
+
+@app.get("/groups/{group_id}/posts", tags=["Posts"])
+async def list_posts(
+    group_id: str,
+    current_user: dict = Depends(get_current_user),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    sort_by: str = Query("newest", enum=["newest", "oldest", "popular"])
+):
+    """List posts in a group."""
+    
+    group = db.postgroups.find_one({"_id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check access for private groups
+    if not group.get("is_public", True):
+        if (current_user["_id"] not in group.get("members", []) and
+            current_user["_id"] not in group.get("moderators", []) and
+            current_user["_id"] != group.get("created_by")):
+            raise HTTPException(status_code=403, detail="Not authorized to access this group")
+    
+    # Build sort order
+    sort_field = "createdAt"
+    sort_direction = -1  # Descending
+    
+    if sort_by == "oldest":
+        sort_direction = 1  # Ascending
+    elif sort_by == "popular":
+        sort_field = "upvotes"
+        sort_direction = -1
+    
+    # Query posts
+    posts = list(db.posts.find({"groupId": group_id})
+                 .sort(sort_field, sort_direction)
+                 .skip(skip)
+                 .limit(limit))
+    
+    # Get user info for posts
+    user_ids = set([post.get("userId") for post in posts])
+    users = list(db.users.find({"_id": {"$in": list(user_ids)}}))
+    user_map = {user["_id"]: user for user in users}
+    
+    # Format posts
+    formatted_posts = []
+    for post in posts:
+        post["_id"] = str(post["_id"])
+        post["createdAt"] = post["createdAt"].isoformat() if post.get("createdAt") else None
+        
+        # Add user info
+        user = user_map.get(post.get("userId"))
+        if user:
+            post["author"] = {
+                "id": user["_id"],
+                "username": user["username"]
+            }
+        
+        # Count comments
+        post["comment_count"] = len(post.get("comments", []))
+        
+        # Check if current user has upvoted/downvoted
+        post["user_upvoted"] = False
+        post["user_downvoted"] = False
+        
+        formatted_posts.append(post)
+    
+    return {
+        "group_id": group_id,
+        "posts": formatted_posts,
+        "count": len(formatted_posts)
+    }
+
+
+@app.post("/groups/{group_id}/posts", tags=["Posts"])
+async def create_post(
+    group_id: str,
+    post_data: dict = Body(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Create a new post in a group."""
+    
+    group = db.postgroups.find_one({"_id": group_id})
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    # Check if user is member (for private groups) or allow anyone for public groups
+    if not group.get("is_public", True):
+        if (current_user["_id"] not in group.get("members", []) and
+            current_user["_id"] not in group.get("moderators", []) and
+            current_user["_id"] != group.get("created_by")):
+            raise HTTPException(status_code=403, detail="Must be a member to post in this group")
+    
+    title = post_data.get("title")
+    content = post_data.get("content")
+    tags = post_data.get("tags", [])
+    files = post_data.get("files", [])
+    
+    if not title or not content:
+        raise HTTPException(status_code=400, detail="Title and content are required")
+    
+    post_id = str(uuid.uuid4())
+    
+    post_doc = {
+        "_id": post_id,
+        "groupId": group_id,
+        "userId": current_user["_id"],
+        "title": title.strip(),
+        "content": content.strip(),
+        "tags": tags,
+        "files": files,
+        "upvotes": 0,
+        "downvotes": 0,
+        "comments": [],
+        "is_pinned": False,
+        "createdAt": datetime.now(timezone.utc)
+    }
+    
+    db.posts.insert_one(post_doc)
+    
+    logger.info(f"Post created: {post_id} in group {group_id} by {current_user['_id']}")
+    
+    return {
+        "message": "Post created successfully",
+        "post_id": post_id,
+        "post": {
+            "id": post_id,
+            "title": title.strip(),
+            "content": content.strip(),
+            "groupId": group_id,
+            "author": {
+                "id": current_user["_id"],
+                "username": current_user["username"]
+            }
+        }
+    }
+
+
+@app.get("/posts/{post_id}", tags=["Posts"])
+async def get_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Get a single post with details."""
+    
+    post = db.posts.find_one({"_id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Get group to check access
+    group = db.postgroups.find_one({"_id": post.get("groupId")})
+    if not group:
+        raise HTTPException(status_code=404, detail="Associated group not found")
+    
+    # Check access for private groups
+    if not group.get("is_public", True):
+        if (current_user["_id"] not in group.get("members", []) and
+            current_user["_id"] not in group.get("moderators", []) and
+            current_user["_id"] != group.get("created_by")):
+            raise HTTPException(status_code=403, detail="Not authorized to access this post")
+    
+    post["_id"] = str(post["_id"])
+    post["createdAt"] = post["createdAt"].isoformat() if post.get("createdAt") else None
+    
+    # Get author info
+    author = db.users.find_one({"_id": post.get("userId")})
+    if author:
+        post["author"] = {
+            "id": author["_id"],
+            "username": author["username"],
+            "email": author["email"]
+        }
+    
+    # Get group info
+    post["group"] = {
+        "id": group["_id"],
+        "name": group.get("name"),
+        "is_public": group.get("is_public", True)
+    }
+    
+    # Format comments with user info
+    comments = post.get("comments", [])
+    if comments:
+        comment_user_ids = [comment.get("userId") for comment in comments if comment.get("userId")]
+        comment_users = list(db.users.find({"_id": {"$in": comment_user_ids}}))
+        comment_user_map = {user["_id"]: user for user in comment_users}
+        
+        for comment in comments:
+            user = comment_user_map.get(comment.get("userId"))
+            if user:
+                comment["author"] = {
+                    "id": user["_id"],
+                    "username": user["username"]
+                }
+            comment["createdAt"] = comment.get("createdAt", datetime.now(timezone.utc)).isoformat()
+    
+    return post
+
+
+@app.post("/posts/{post_id}/upvote", tags=["Posts"])
+async def upvote_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Upvote a post."""
+    
+    post = db.posts.find_one({"_id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    # Check if already upvoted (simplified - in real app, track per user)
+    # For now, just increment
+    result = db.posts.update_one(
+        {"_id": post_id},
+        {"$inc": {"upvotes": 1}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to upvote post")
+    
+    return {
+        "message": "Post upvoted",
+        "post_id": post_id,
+        "upvotes": post.get("upvotes", 0) + 1
+    }
+
+
+@app.post("/posts/{post_id}/downvote", tags=["Posts"])
+async def downvote_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    """Downvote a post."""
+    
+    post = db.posts.find_one({"_id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    result = db.posts.update_one(
+        {"_id": post_id},
+        {"$inc": {"downvotes": 1}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to downvote post")
+    
+    return {
+        "message": "Post downvoted",
+        "post_id": post_id,
+        "downvotes": post.get("downvotes", 0) + 1
+    }
+
+
+@app.post("/posts/{post_id}/comments", tags=["Posts"])
+async def add_comment(
+    post_id: str,
+    comment_data: dict = Body(...),
+    current_user: dict = Depends(get_current_user)
+):
+    """Add a comment to a post."""
+    
+    post = db.posts.find_one({"_id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    
+    content = comment_data.get("content")
+    parent_comment_id = comment_data.get("parentCommentId")
+    
+    if not content:
+        raise HTTPException(status_code=400, detail="Comment content is required")
+    
+    comment_id = str(uuid.uuid4())
+    
+    comment = {
+        "_id": comment_id,
+        "postId": post_id,
+        "userId": current_user["_id"],
+        "content": content.strip(),
+        "parentCommentId": parent_comment_id,
+        "upvotes": 0,
+        "downvotes": 0,
+        "createdAt": datetime.now(timezone.utc)
+    }
+    
+    # Add comment to post
+    result = db.posts.update_one(
+        {"_id": post_id},
+        {"$push": {"comments": comment}}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to add comment")
+    
+    logger.info(f"Comment added to post {post_id} by {current_user['_id']}")
+    
+    return {
+        "message": "Comment added successfully",
+        "comment_id": comment_id,
+        "comment": {
+            "id": comment_id,
+            "content": content.strip(),
+            "author": {
+                "id": current_user["_id"],
+                "username": current_user["username"]
+            }
+        }
+    }

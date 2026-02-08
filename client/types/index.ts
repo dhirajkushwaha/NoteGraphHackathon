@@ -73,3 +73,106 @@ export interface ApiError {
   status_code?: number;
   detail?: string;
 }
+
+
+export interface SpaceUser {
+  id: string;
+  username: string;
+  email: string;
+  is_owner: boolean;
+  added_at?: string;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+// Add these to your existing types.ts
+
+export interface PostGroup {
+  _id: string;
+  id?: string;
+  name: string;
+  description?: string;
+  is_public: boolean;
+  created_by: string;
+  members: string[];
+  moderators: string[];
+  createdAt: string;
+  created_by_user?: {
+    id: string;
+    username: string;
+  };
+  is_member?: boolean;
+  is_moderator?: boolean;
+  is_creator?: boolean;
+  member_count?: number;
+  current_user_role?: 'creator' | 'moderator' | 'member' | 'non_member';
+}
+
+export interface Post {
+  _id: string;
+  groupId: string;
+  userId: string;
+  title: string;
+  content: string;
+  tags: string[];
+  files: string[];
+  upvotes: number;
+  downvotes: number;
+  comments: Comment[];
+  is_pinned: boolean;
+  createdAt: string;
+  author?: {
+    id: string;
+    username: string;
+  };
+  comment_count?: number;
+  user_upvoted?: boolean;
+  user_downvoted?: boolean;
+  group?: {
+    id: string;
+    name: string;
+    is_public: boolean;
+  };
+}
+
+export interface Comment {
+  _id: string;
+  postId: string;
+  userId: string;
+  content: string;
+  parentCommentId?: string;
+  upvotes: number;
+  downvotes: number;
+  createdAt: string;
+  author?: {
+    id: string;
+    username: string;
+  };
+}
+
+export interface CreateGroupData {
+  name: string;
+  description?: string;
+  is_public: boolean;
+}
+
+export interface CreatePostData {
+  title: string;
+  content: string;
+  tags?: string[];
+  files?: string[];
+}
+
+export interface CreateCommentData {
+  content: string;
+  parentCommentId?: string;
+}

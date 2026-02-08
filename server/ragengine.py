@@ -349,7 +349,9 @@ class RAGEngine:
                 # Extract text based on file type
                 if file_path.lower().endswith(".pdf"):
                     text = self.read_pdf(file_path)
-                elif file_path.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                elif file_path.lower().endswith(
+                    (".png", ".jpg", ".jpeg", ".gif", ".bmp")
+                ):
                     text = self.read_image(file_path)
                 elif file_path.lower().endswith(".txt"):
                     text = self.read_txt(file_path)
@@ -382,7 +384,9 @@ class RAGEngine:
             logger.info(f"Generating embeddings for {len(all_chunks)} new chunks")
 
             # Generate embeddings with numpy arrays
-            embeddings = self.embedder.encode(all_chunks, convert_to_tensor=False)
+            embeddings = self.embedder.encode(
+                all_chunks, convert_to_tensor=False
+            )
 
             # Convert embeddings to Python lists for Neo4j
             embeddings_list = []
@@ -406,18 +410,25 @@ class RAGEngine:
             else:
                 # Create new BM25 index if this is the first ingestion
                 self.space_documents[space] = all_chunks
-
+            
             # Recreate BM25 with ALL documents (existing + new)
-            self.space_bm25[space] = BM25Okapi(
-                [doc.split() for doc in self.space_documents[space]]
-            )
+            # Make sure BM25Okapi is imported!
+            self.space_bm25[space] = BM25Okapi([doc.split() for doc in self.space_documents[space]])
 
             logger.info(
                 f"✅ Successfully ingested {len(all_chunks)} new chunks into space {space}"
             )
+            return len(all_chunks)  # Return success with chunk count
+            
         except Exception as e:
             logger.error(f"Error during incremental ingestion: {e}")
             raise
+        
+        
+        
+        
+        
+        
 
 
     # Also update the existing ingest method to optionally not clear data:

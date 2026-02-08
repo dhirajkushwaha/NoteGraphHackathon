@@ -43,6 +43,13 @@ export const Navbar: React.FC = () => {
                 >
                   Study Spaces
                 </Link>
+                {/* ADDED: Discussion Rooms Link */}
+                <Link
+                  href="/groups"
+                  className="text-gray-500 dark:text-gray-300 hover:text-gray-700 dark:hover:text-white px-3 py-2 rounded-md text-sm font-medium"
+                >
+                  Discussion Rooms
+                </Link>
               </div>
             )}
           </div>
@@ -119,6 +126,14 @@ export const Navbar: React.FC = () => {
                   onClick={() => setIsMenuOpen(false)}
                 >
                   Study Spaces
+                </Link>
+                {/* ADDED: Discussion Rooms Link for Mobile */}
+                <Link
+                  href="/groups"
+                  className="block px-3 py-2 rounded-md text-base font-medium text-gray-500 dark:text-gray-300 hover:text-gray-700 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-gray-700"
+                  onClick={() => setIsMenuOpen(false)}
+                >
+                  Discussion Rooms
                 </Link>
                 <div className="px-3 py-2">
                   <div className="flex items-center space-x-3">
